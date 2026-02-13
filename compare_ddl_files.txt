@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# -----------------------------
+# Regex helpers
+# -----------------------------
+
+CREATE_LINE_RE = re.compile(r"^\s*CREATE\s+", re.IGNORECASE | re.MULTILINE)
+
+OBJ_HEADER_RE = re.compile(
+    r"""^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?P<otype>PACKAGE\s+BODY|TYPE\s+BODY|PACKAGE|TYPE|VIEW|TABLE|INDEX|SEQUENCE|PROCEDURE|FUNCTION|TRIGGER)\s+
+        (?P<oname>(?:"[^"]+"|\w[\w$#]*)(?:\s*\.\s*(?:"[^"]+"|\w[\w$#]*))?)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+COMMENT_LINE_RE = re.compile(r"^\s*--.*?$", re.MULTILINE)
+COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+# Optional clause stripping (helps avoid false mismatches across env)
+# These patterns are intentionally broad; you can tune/extend as needed.
+
+STRIP_PATTERNS = [
+    # tablespace clauses
+    re.compile(r"\bTABLESPACE\b\s+\w[\w$#]*", re.IGNORECASE),
+    # physical storage blocks
+    re.compile(r"\bSTORAGE\b\s*\(.*?\)", re.IGNORECASE | re.DOTALL),
+    # pctfree/pctused/initrans/maxtrans
+    re.compile(r"\bPCTFREE\b\s+\d+", re.IGNORECASE),
+    re.compile(r"\bPCTUSED\b\s+\d+", re.IGNORECASE),
+    re.compile(r"\bINITRANS\b\s+\d+", re.IGNORECASE),
+    re.compile(r"\bMAXTRANS\b\s+\d+", re.IGNORECASE),
+    # logging / parallel
+    re.compile(r"\bNOLOGGING\b|\bLOGGING\b", re.IGNORECASE),
+    re.compile(r"\bNOPARALLEL\b|\bPARALLEL\b(?:\s+\d+)?", re.IGNORECASE),
+    # compress
+    re.compile(r"\bNOCOMPRESS\b|\bCOMPRESS\b(?:\s+\w+)?", re.IGNORECASE),
+    # segment creation
+    re.compile(r"\bSEGMENT\s+CREATION\b\s+(?:IMMEDIATE|DEFERRED)", re.IGNORECASE),
+    # caching for sequences
+    re.compile(r"\bCACHE\b\s+\d+|\bNOCACHE\b", re.IGNORECASE),
+]
+
+
+def unquote_ident(ident: str) -> str:
+    ident = ident.strip()
+    if ident.startswith('"') and ident.endswith('"'):
+        return ident[1:-1]
+    return ident
+
+
+def split_schema_object(qualified: str) -> Tuple[Optional[str], str]:
+    s = qualified.strip()
+    if "." in s:
+        left, right = [p.strip() for p in s.split(".", 1)]
+        return unquote_ident(left), unquote_ident(right)
+    return None, unquote_ident(s)
+
+
+def safe_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\-$#]+", "_", s.strip())
+
+
+# -----------------------------
+# Normalization and diff support
+# -----------------------------
+
+def normalize_sql(text: str, strip_physical: bool = True) -> str:
+    """
+    Normalize SQL to make comparisons robust:
+      - remove /* */ and -- comments
+      - (optional) strip environment-specific physical/storage clauses
+      - collapse whitespace
+      - uppercase
+    """
+    t = COMMENT_BLOCK_RE.sub("", text)
+    t = COMMENT_LINE_RE.sub("", t)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    if strip_physical:
+        for pat in STRIP_PATTERNS:
+            t = pat.sub("", t)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.upper()
+
+
+def simple_unified_diff(a: str, b: str, fromfile: str, tofile: str) -> str:
+    """
+    No external deps: minimal unified diff using stdlib.
+    """
+    import difflib
+
+    a_lines = a.splitlines(keepends=True)
+    b_lines = b.splitlines(keepends=True)
+    diff = difflib.unified_diff(a_lines, b_lines, fromfile=fromfile, tofile=tofile)
+    return "".join(diff)
+
+
+# -----------------------------
+# Statement splitting
+# -----------------------------
+
+def split_oracle_statements(sql_text: str) -> List[str]:
+    """
+    Split file into CREATE statements.
+
+    End conditions:
+      - PL/SQL: a line with only "/" terminates
+      - Non-PL/SQL: semicolon that ends a line terminates
+    """
+    lines = sql_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    stmts: List[str] = []
+    buf: List[str] = []
+    in_stmt = False
+    plsql_mode = False
+
+    def is_plsql_type(otype: str) -> bool:
+        return otype in {
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "PACKAGE BODY",
+            "TYPE",
+            "TYPE BODY",
+            "TRIGGER",
+        }
+
+    def detect_header(line_or_stmt: str) -> Optional[Tuple[str, str]]:
+        """
+        Return (otype, oname_token) from a CREATE header (best-effort).
+        """
+        m = OBJ_HEADER_RE.search(line_or_stmt)
+        if not m:
+            return None
+        otype = re.sub(r"\s+", " ", m.group("otype").strip()).upper()
+        oname_token = m.group("oname").strip()
+        return otype, oname_token
+
+    def flush():
+        nonlocal buf, in_stmt, plsql_mode
+        stmt = "\n".join(buf).strip()
+        if stmt:
+            stmts.append(stmt)
+        buf = []
+        in_stmt = False
+        plsql_mode = False
+
+    for line in lines:
+        if not in_stmt and CREATE_LINE_RE.match(line):
+            in_stmt = True
+            buf.append(line)
+            hdr = detect_header(line)
+            if hdr:
+                otype, _ = hdr
+                plsql_mode = is_plsql_type(otype)
+            continue
+
+        if in_stmt:
+            buf.append(line)
+
+            if plsql_mode and line.strip() == "/":
+                flush()
+                continue
+
+            if (not plsql_mode) and line.rstrip().endswith(";"):
+                flush()
+                continue
+
+    if in_stmt and buf:
+        flush()
+
+    return stmts
+
+
+# -----------------------------
+# Object key model
+# -----------------------------
+@dataclass(frozen=True)
+class ObjKey:
+    obj_type: str
+    user: str
+    obj_name: str
+
+
+def extract_object_info(stmt: str) -> Optional[ObjKey]:
+    m = OBJ_HEADER_RE.search(stmt)
+    if not m:
+        return None
+    obj_type = re.sub(r"\s+", " ", m.group("otype").strip()).upper()
+    qualified = m.group("oname").strip()
+    schema, name = split_schema_object(qualified)
+    user = schema if schema else "UNKNOWN"
+    return ObjKey(obj_type=obj_type, user=user, obj_name=name)
+
+
+def write_split_files(sql_path: Path, out_dir: Path) -> Dict[ObjKey, Path]:
+    text = sql_path.read_text(encoding="utf-8", errors="ignore")
+    stmts = split_oracle_statements(text)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mapping: Dict[ObjKey, Path] = {}
+
+    for stmt in stmts:
+        key = extract_object_info(stmt)
+        if not key:
+            continue
+
+        # Filename ignores schema/user
+        fname = f"{safe_filename(key.obj_type.replace(' ', '_'))}_{safe_filename(key.obj_name)}.sql"
+        fpath = out_dir / fname
+
+        # Ensure uniqueness if duplicates appear
+        if fpath.exists():
+            i = 2
+            while True:
+                fpath2 = out_dir / f"{safe_filename(key.obj_type.replace(' ', '_'))}_{safe_filename(key.obj_name)}__{i}.sql"
+                if not fpath2.exists():
+                    fpath = fpath2
+                    break
+                i += 1
+
+        fpath.write_text(stmt.strip() + "\n", encoding="utf-8", errors="ignore")
+        mapping[key] = fpath
+
+    return mapping
+
+
+def build_csv_and_compare(
+    prod_map: Dict[ObjKey, Path],
+    qat_map: Dict[ObjKey, Path],
+    csv_path: Path,
+    write_diffs: bool = False,
+    diffs_dir: Optional[Path] = None,
+) -> None:
+    all_keys = sorted(set(prod_map) | set(qat_map), key=lambda k: (k.obj_type, k.user, k.obj_name))
+
+    if write_diffs:
+        diffs_dir = diffs_dir or (csv_path.parent / "diffs")
+        diffs_dir.mkdir(parents=True, exist_ok=True)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            ["Prod Filename", "QAT Filename", "Object Type", "User", "Object Name", "Comparison result"]
+        )
+
+        for key in all_keys:
+            prod_file = prod_map.get(key)
+            qat_file = qat_map.get(key)
+
+            prod_yes = "Yes" if prod_file else "No"
+            qat_yes = "Yes" if qat_file else "No"
+
+            if prod_file and qat_file:
+                p_txt = prod_file.read_text(encoding="utf-8", errors="ignore")
+                q_txt = qat_file.read_text(encoding="utf-8", errors="ignore")
+
+                # normalized compare (ignores formatting, comments, and physical/storage clauses)
+                same = normalize_sql(p_txt, strip_physical=True) == normalize_sql(q_txt, strip_physical=True)
+                cmp = "Match" if same else "Mismatch"
+
+                if write_diffs and not same:
+                    diff_text = simple_unified_diff(
+                        p_txt, q_txt,
+                        fromfile=str(prod_file.name),
+                        tofile=str(qat_file.name),
+                    )
+                    diff_name = f"{safe_filename(key.obj_type)}_{safe_filename(key.user)}_{safe_filename(key.obj_name)}.diff"
+                    (diffs_dir / diff_name).write_text(diff_text, encoding="utf-8", errors="ignore")
+
+            elif prod_file and not qat_file:
+                cmp = "missing in QAT"
+            else:
+                cmp = "missing in PROD"
+
+            w.writerow([prod_yes, qat_yes, key.obj_type, key.user, key.obj_name, cmp])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prod", required=True, help="Prod SQL file (DDL export)")
+    ap.add_argument("--qat", required=True, help="QAT SQL file (DDL export)")
+    ap.add_argument("--out", default="objects.csv", help="Output CSV path")
+    ap.add_argument("--prod-dir", default="Prod", help="Output dir for prod split files")
+    ap.add_argument("--qat-dir", default="QAT", help="Output dir for qat split files")
+    ap.add_argument("--write-diffs", action="store_true", help="Write unified diffs for mismatches")
+    args = ap.parse_args()
+
+    prod_sql = Path(args.prod)
+    qat_sql = Path(args.qat)
+
+    prod_dir = Path(args.prod_dir)
+    qat_dir = Path(args.qat_dir)
+    csv_path = Path(args.out)
+
+    prod_map = write_split_files(prod_sql, prod_dir)
+    qat_map = write_split_files(qat_sql, qat_dir)
+
+    build_csv_and_compare(
+        prod_map,
+        qat_map,
+        csv_path,
+        write_diffs=args.write_diffs,
+        diffs_dir=csv_path.parent / "diffs",
+    )
+
+    print(f"Split files created in: {prod_dir.resolve()} and {qat_dir.resolve()}")
+    print(f"CSV written to: {csv_path.resolve()}")
+    if args.write_diffs:
+        print(f"Diffs written to: {(csv_path.parent / 'diffs').resolve()}")
+
+
+if __name__ == "__main__":
+    main()
