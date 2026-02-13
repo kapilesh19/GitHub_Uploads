@@ -1,32 +1,50 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+oracle_ddl_compare_py27.py  (Python 2.7.5 compatible)
+
+What it does:
+- Uses markers to split each export file into 1 DDL block per object:
+    START marker line:  "~~##~~
+    END marker line:    ~~##~~"
+- Writes split files into Prod/ and QAT/ folders:
+    <ObjectType>_<ObjectName>.sql   (schema removed from filename)
+- Creates CSV inventory:
+    Prod Filename (Yes/No), QAT Filename (Yes/No), Object Type, User, Object Name, Comparison result
+- If an object exists in BOTH Prod and QAT and differs (after normalization),
+  writes ONE mismatch file per object into the folder passed via --mismatch-dir.
+  (No mismatch file created if Match.)
+
+Usage:
+  python oracle_ddl_compare_py27.py --prod Prod_file.sql --qat QAT_file.sql --out objects.csv --mismatch-dir Diff
+"""
+
 import argparse
 import csv
+import os
 import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 # -----------------------------
-# Marker lines
+# Marker lines (exact lines)
 # -----------------------------
-START_RE = re.compile(r'^\s*"\s*~~##~~\s*$', re.IGNORECASE) #This is the start of each DDL in the export
-END_RE   = re.compile(r'^\s*~~##~~\s*"\s*$', re.IGNORECASE) #This is the end of each DDL in the export
+START_RE = re.compile(r'^\s*"\s*~~##~~\s*$')   # start of each DDL block
+END_RE   = re.compile(r'^\s*~~##~~\s*"\s*$')   # end of each DDL block
 
 # -----------------------------
 # Object header parsing
 # -----------------------------
+# NOTE: This looks for the first CREATE ... <TYPE> <NAME> inside the block.
 OBJ_HEADER_RE = re.compile(
-    r"""^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?P<otype>PACKAGE\s+BODY|TYPE\s+BODY|PACKAGE|TYPE|VIEW|TABLE|INDEX|SEQUENCE|PROCEDURE|FUNCTION|TRIGGER)\s+
-        (?P<oname>(?:"[^"]+"|\w[\w$#]*)(?:\s*\.\s*(?:"[^"]+"|\w[\w$#]*))?)
-    """,
-    re.IGNORECASE | re.VERBOSE | re.MULTILINE,
+    r'CREATE\s+(?:OR\s+REPLACE\s+)?'
+    r'(PACKAGE\s+BODY|TYPE\s+BODY|PACKAGE|TYPE|VIEW|TABLE|INDEX|SEQUENCE|PROCEDURE|FUNCTION|TRIGGER)\s+'
+    r'((?:"[^"]+"|\w[\w$#]*)(?:\s*\.\s*(?:"[^"]+"|\w[\w$#]*))?)',
+    re.IGNORECASE
 )
 
 COMMENT_LINE_RE  = re.compile(r"^\s*--.*?$", re.MULTILINE)
 COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
-# Stripping oracle related environment variables to make comparison more in terms of code
-
+# Stripping env-specific clauses to compare "logical" DDL
 STRIP_PATTERNS = [
     re.compile(r"\bTABLESPACE\b\s+\w[\w$#]*", re.IGNORECASE),
     re.compile(r"\bSTORAGE\b\s*\(.*?\)", re.IGNORECASE | re.DOTALL),
@@ -41,21 +59,27 @@ STRIP_PATTERNS = [
     re.compile(r"\bCACHE\b\s+\d+|\bNOCACHE\b", re.IGNORECASE),
 ]
 
-def unquote_ident(s: str) -> str:
-    s = s.strip()
-    return s[1:-1] if s.startswith('"') and s.endswith('"') else s
+def ensure_dir(path):
+    if path and (not os.path.exists(path)):
+        os.makedirs(path)
 
-def split_schema_object(qualified: str) -> Tuple[Optional[str], str]:
-    q = qualified.strip()
-    if "." in q:
-        left, right = [p.strip() for p in q.split(".", 1)]
-        return unquote_ident(left), unquote_ident(right)
-    return None, unquote_ident(q)
-
-def safe_filename(s: str) -> str:
+def safe_filename(s):
     return re.sub(r"[^A-Za-z0-9_\-$#]+", "_", s.strip())
 
-def normalize_sql(text: str, strip_physical: bool = True) -> str:
+def unquote_ident(s):
+    s = s.strip()
+    if s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+    return s
+
+def split_schema_object(qualified):
+    q = qualified.strip()
+    if "." in q:
+        left, right = q.split(".", 1)
+        return unquote_ident(left.strip()), unquote_ident(right.strip())
+    return None, unquote_ident(q)
+
+def normalize_sql(text, strip_physical=True):
     t = COMMENT_BLOCK_RE.sub("", text)
     t = COMMENT_LINE_RE.sub("", t)
     t = t.replace("\r\n", "\n").replace("\r", "\n")
@@ -65,17 +89,18 @@ def normalize_sql(text: str, strip_physical: bool = True) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t.upper()
 
-def split_blocks_by_markers(sql_text: str) -> List[str]:
+def split_blocks_by_markers(sql_text):
     lines = sql_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    blocks: List[str] = []
-    buf: List[str] = []
+    blocks = []
+    buf = []
     inside = False
 
     for line in lines:
-        if not inside and START_RE.match(line):
+        if (not inside) and START_RE.match(line):
             inside = True
             buf = []
             continue
+
         if inside and END_RE.match(line):
             block = "\n".join(buf).strip()
             if block:
@@ -83,148 +108,219 @@ def split_blocks_by_markers(sql_text: str) -> List[str]:
             inside = False
             buf = []
             continue
+
         if inside:
             buf.append(line)
 
+    # If file ends while still inside a block, keep it
     if inside:
         block = "\n".join(buf).strip()
         if block:
             blocks.append(block)
 
     return blocks
-@dataclass(frozen=True)
-class ObjKey:
-    obj_type: str
-    obj_name: str
 
-def extract_object(block: str) -> Optional[Tuple[ObjKey, str]]:
+def extract_object(block):
+    """
+    Returns ((obj_type, obj_name), user) or None.
+    Key ignores schema to avoid duplicate rows.
+    """
     m = OBJ_HEADER_RE.search(block)
     if not m:
         return None
-    obj_type = re.sub(r"\s+", " ", m.group("otype").strip()).upper()
-    qualified = m.group("oname").strip()
+
+    obj_type = re.sub(r"\s+", " ", m.group(1).strip()).upper()
+    qualified = m.group(2).strip()
+
     schema, name = split_schema_object(qualified)
     user = schema if schema else "UNKNOWN"
-    return ObjKey(obj_type=obj_type, obj_name=name), user
+    key = (obj_type, name)
+    return key, user
 
-def write_split_files(sql_path: Path, out_dir: Path) -> Dict[ObjKey, Tuple[Path, str]]:
-    text = sql_path.read_text(encoding="utf-8", errors="ignore")
-    blocks = split_blocks_by_markers(text)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def read_file(path):
+    f = open(path, "rb")
+    try:
+        return f.read()
+    finally:
+        f.close()
 
-    mapping: Dict[ObjKey, Tuple[Path, str]] = {}
+def write_file(path, content):
+    f = open(path, "wb")
+    try:
+        if isinstance(content, unicode):
+            content = content.encode("utf-8")
+        f.write(content)
+    finally:
+        f.close()
+
+def write_split_files(sql_path, out_dir):
+    ensure_dir(out_dir)
+    text = read_file(sql_path)
+    # best-effort decode; keep bytes if decode fails
+    try:
+        text_u = text.decode("utf-8")
+    except:
+        try:
+            text_u = text.decode("latin-1")
+        except:
+            text_u = text  # bytes
+
+    blocks = split_blocks_by_markers(text_u)
+    mapping = {}  # key -> (filepath, user)
 
     for block in blocks:
         extracted = extract_object(block)
         if not extracted:
             continue
+
         key, user = extracted
+        obj_type, obj_name = key
 
-        fname = f"{safe_filename(key.obj_type.replace(' ', '_'))}_{safe_filename(key.obj_name)}.sql"
-        fpath = out_dir / fname
+        fname = "%s_%s.sql" % (safe_filename(obj_type.replace(" ", "_")), safe_filename(obj_name))
+        fpath = os.path.join(out_dir, fname)
 
-        if fpath.exists():
+        # avoid overwriting duplicates
+        if os.path.exists(fpath):
             i = 2
             while True:
-                fpath2 = out_dir / f"{safe_filename(key.obj_type.replace(' ', '_'))}_{safe_filename(key.obj_name)}__{i}.sql"
-                if not fpath2.exists():
+                fname2 = "%s_%s__%d.sql" % (safe_filename(obj_type.replace(" ", "_")), safe_filename(obj_name), i)
+                fpath2 = os.path.join(out_dir, fname2)
+                if not os.path.exists(fpath2):
                     fpath = fpath2
                     break
                 i += 1
 
-        fpath.write_text(block.strip() + "\n", encoding="utf-8", errors="ignore")
+        write_file(fpath, block.strip() + "\n")
         mapping[key] = (fpath, user)
 
     return mapping
 
-def write_mismatch_file(mismatch_dir: Path, key: ObjKey, prod_file: Path, qat_file: Path) -> None:
-   
-    #Writes one mismatch file per object
-    
-    mismatch_dir.mkdir(parents=True, exist_ok=True)
+def write_mismatch_file(mismatch_dir, key, prod_file, qat_file):
+    """
+    Writes one mismatch file per object (only when mismatch).
+    File contains both Prod and QAT DDL blocks.
+    """
+    ensure_dir(mismatch_dir)
 
-    out_name = f"{safe_filename(key.obj_type.replace(' ', '_'))}_{safe_filename(key.obj_name)}_MISMATCH.sql"
-    out_path = mismatch_dir / out_name
+    obj_type, obj_name = key
+    out_name = "%s_%s_MISMATCH.sql" % (safe_filename(obj_type.replace(" ", "_")), safe_filename(obj_name))
+    out_path = os.path.join(mismatch_dir, out_name)
 
-    prod_txt = prod_file.read_text(encoding="utf-8", errors="ignore")
-    qat_txt  = qat_file.read_text(encoding="utf-8", errors="ignore")
+    prod_txt = read_file(prod_file)
+    qat_txt  = read_file(qat_file)
+
+    # Try to decode for nicer output; fallback to raw bytes.
+    def to_text(b):
+        try:
+            return b.decode("utf-8")
+        except:
+            try:
+                return b.decode("latin-1")
+            except:
+                return b
+
+    prod_t = to_text(prod_txt)
+    qat_t  = to_text(qat_txt)
 
     combined = (
-        f"-- =====================================================\n"
-        f"-- MISMATCH: {key.obj_type} {key.obj_name}\n"
-        f"-- PROD FILE: {prod_file}\n"
-        f"-- QAT  FILE: {qat_file}\n"
-        f"-- =====================================================\n\n"
-        f"-- ===================== PROD ==========================\n"
-        f"{prod_txt}\n\n"
-        f"-- ====================== QAT ==========================\n"
-        f"{qat_txt}\n"
-    )
+        "-- =====================================================\n"
+        "-- MISMATCH: %s %s\n"
+        "-- PROD FILE: %s\n"
+        "-- QAT  FILE: %s\n"
+        "-- =====================================================\n\n"
+        "-- ===================== PROD ==========================\n"
+        "%s\n\n"
+        "-- ====================== QAT ==========================\n"
+        "%s\n"
+    ) % (obj_type, obj_name, prod_file, qat_file, prod_t, qat_t)
 
-    out_path.write_text(combined, encoding="utf-8", errors="ignore")
+    write_file(out_path, combined)
 
-def build_csv(prod_map: Dict[ObjKey, Tuple[Path, str]],
-              qat_map: Dict[ObjKey, Tuple[Path, str]],
-              csv_path: Path,
-              mismatch_dir: Optional[Path] = None) -> None:
+def build_csv(prod_map, qat_map, csv_path, mismatch_dir=None):
+    keys = set(prod_map.keys()) | set(qat_map.keys())
+    keys = sorted(list(keys), key=lambda k: (k[0], k[1]))  # (obj_type, obj_name)
 
-    all_keys = sorted(set(prod_map) | set(qat_map), key=lambda k: (k.obj_type, k.obj_name))
-
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
+    # Python 2 csv needs binary mode
+    f = open(csv_path, "wb")
+    try:
         w = csv.writer(f)
         w.writerow(["Prod Filename", "QAT Filename", "Object Type", "User", "Object Name", "Comparison result"])
 
-        for key in all_keys:
+        for key in keys:
             p = prod_map.get(key)  # (path, user)
             q = qat_map.get(key)
 
             prod_yes = "Yes" if p else "No"
             qat_yes  = "Yes" if q else "No"
 
-            # User column = Prod user if exists else QAT user
-            user = (p[1] if p else q[1]) if (p or q) else "UNKNOWN"
+            # user = Prod user if exists else QAT user
+            if p:
+                user = p[1]
+            elif q:
+                user = q[1]
+            else:
+                user = "UNKNOWN"
 
             if p and q:
-                p_txt = p[0].read_text(encoding="utf-8", errors="ignore")
-                q_txt = q[0].read_text(encoding="utf-8", errors="ignore")
-                same = normalize_sql(p_txt) == normalize_sql(q_txt)
-                cmp = "Match" if same else "Mismatch"
+                p_txt = read_file(p[0])
+                q_txt = read_file(q[0])
 
-                # only create mismatch file when different AND mismatch_dir provided
-                if (not same) and mismatch_dir is not None:
+                # decode best-effort for normalization
+                try:
+                    p_u = p_txt.decode("utf-8")
+                except:
+                    try:
+                        p_u = p_txt.decode("latin-1")
+                    except:
+                        p_u = p_txt
+                try:
+                    q_u = q_txt.decode("utf-8")
+                except:
+                    try:
+                        q_u = q_txt.decode("latin-1")
+                    except:
+                        q_u = q_txt
+
+                same = (normalize_sql(p_u) == normalize_sql(q_u))
+                cmp_res = "Match" if same else "Mismatch"
+
+                if (not same) and mismatch_dir:
                     write_mismatch_file(mismatch_dir, key, p[0], q[0])
 
-            elif p and not q:
-                cmp = "missing in QAT"
+            elif p and (not q):
+                cmp_res = "missing in QAT"
             else:
-                cmp = "missing in PROD"
+                cmp_res = "missing in PROD"
 
-            w.writerow([prod_yes, qat_yes, key.obj_type, user, key.obj_name, cmp])
+            w.writerow([prod_yes, qat_yes, key[0], user, key[1], cmp_res])
+    finally:
+        f.close()
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prod", required=True)
-    ap.add_argument("--qat", required=True)
-    ap.add_argument("--out", default="objects.csv")
-    ap.add_argument("--prod-dir", default="Prod")
-    ap.add_argument("--qat-dir", default="QAT")
-    ap.add_argument("--mismatch-dir", default="Diff", help="Folder to write mismatch files (one per object). Created only when mismatches exist.")
-
+    ap.add_argument("--prod", required=True, help="Prod export SQL file")
+    ap.add_argument("--qat", required=True, help="QAT export SQL file")
+    ap.add_argument("--out", default="objects.csv", help="Output CSV file")
+    ap.add_argument("--prod-dir", default="Prod", help="Output dir for Prod split files")
+    ap.add_argument("--qat-dir", default="QAT", help="Output dir for QAT split files")
+    ap.add_argument("--mismatch-dir", default="Diff", help="Folder for mismatch files (only created if mismatches exist)")
     args = ap.parse_args()
 
-    prod_map = write_split_files(Path(args.prod), Path(args.prod_dir))
-    qat_map  = write_split_files(Path(args.qat),  Path(args.qat_dir))
+    prod_map = write_split_files(args.prod, args.prod_dir)
+    qat_map  = write_split_files(args.qat,  args.qat_dir)
 
-    mismatch_dir = Path(args.mismatch_dir) if args.mismatch_dir else None
+    # Only create mismatch dir when we actually write mismatches.
+    # We'll pass it in; ensure_dir is called only if mismatch happens.
+    mismatch_dir = args.mismatch_dir if args.mismatch_dir else None
 
-    build_csv(prod_map, qat_map, Path(args.out), mismatch_dir=mismatch_dir)
+    build_csv(prod_map, qat_map, args.out, mismatch_dir=mismatch_dir)
 
-    print("Done.")
-    print(f"Prod folder: {Path(args.prod_dir).resolve()}")
-    print(f"QAT  folder: {Path(args.qat_dir).resolve()}")
-    print(f"CSV: {Path(args.out).resolve()}")
+    print "Done."
+    print "Prod folder:", os.path.abspath(args.prod_dir)
+    print "QAT  folder:", os.path.abspath(args.qat_dir)
+    print "CSV:", os.path.abspath(args.out)
     if mismatch_dir:
-        print(f"Mismatch files folder: {mismatch_dir.resolve()} (only mismatches are written)")
+        print "Mismatch folder (only if mismatches exist):", os.path.abspath(mismatch_dir)
 
 if __name__ == "__main__":
     main()
