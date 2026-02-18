@@ -1,0 +1,29 @@
+def diff_line_pairs(ddl1, ddl2):
+    a = ddl1.splitlines()
+    b = ddl2.splitlines()
+
+    sm = difflib.SequenceMatcher(None, a, b)
+    changes = []
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+
+        if tag == 'replace':
+            old_lines = a[i1:i2]
+            new_lines = b[j1:j2]
+            maxlen = max(len(old_lines), len(new_lines))
+            for k in range(maxlen):
+                old = old_lines[k] if k < len(old_lines) else ""
+                new = new_lines[k] if k < len(new_lines) else ""
+                changes.append(('REPLACE', old, new))
+
+        elif tag == 'delete':
+            for old in a[i1:i2]:
+                changes.append(('DELETE', old, ""))
+
+        elif tag == 'insert':
+            for new in b[j1:j2]:
+                changes.append(('INSERT', "", new))
+
+    return changes
