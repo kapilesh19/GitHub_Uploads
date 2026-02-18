@@ -27,3 +27,32 @@ def diff_line_pairs(ddl1, ddl2):
                 changes.append(('INSERT', "", new))
 
     return changes
+
+
+import difflib
+import re
+
+def word_level_changes(old_line, new_line):
+    # split into tokens (keeps punctuation as separate tokens)
+    tok = lambda s: re.findall(r'\w+|[^\w\s]', s, re.UNICODE)
+    a = tok(old_line)
+    b = tok(new_line)
+
+    out = []
+    for x in difflib.ndiff(a, b):
+        # x starts with '  ' (same), '- ' (removed), '+ ' (added)
+        if x.startswith('- ') or x.startswith('+ '):
+            out.append(x)
+    return out
+
+def diff_with_values(ddl1, ddl2):
+    changes = diff_line_pairs(ddl1, ddl2)
+    detailed = []
+
+    for typ, old, new in changes:
+        if typ == 'REPLACE' and old and new:
+            detailed.append((typ, old, new, word_level_changes(old, new)))
+        else:
+            detailed.append((typ, old, new, []))
+
+    return detailed
