@@ -1,58 +1,15 @@
-def diff_line_pairs(ddl1, ddl2):
-    a = ddl1.splitlines()
-    b = ddl2.splitlines()
-
-    sm = difflib.SequenceMatcher(None, a, b)
-    changes = []
-
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'equal':
-            continue
-
-        if tag == 'replace':
-            old_lines = a[i1:i2]
-            new_lines = b[j1:j2]
-            maxlen = max(len(old_lines), len(new_lines))
-            for k in range(maxlen):
-                old = old_lines[k] if k < len(old_lines) else ""
-                new = new_lines[k] if k < len(new_lines) else ""
-                changes.append(('REPLACE', old, new))
-
-        elif tag == 'delete':
-            for old in a[i1:i2]:
-                changes.append(('DELETE', old, ""))
-
-        elif tag == 'insert':
-            for new in b[j1:j2]:
-                changes.append(('INSERT', "", new))
-
-    return changes
-
-
-import difflib
-import re
-
-def word_level_changes(old_line, new_line):
-    # split into tokens (keeps punctuation as separate tokens)
-    tok = lambda s: re.findall(r'\w+|[^\w\s]', s, re.UNICODE)
-    a = tok(old_line)
-    b = tok(new_line)
-
-    out = []
-    for x in difflib.ndiff(a, b):
-        # x starts with '  ' (same), '- ' (removed), '+ ' (added)
-        if x.startswith('- ') or x.startswith('+ '):
-            out.append(x)
-    return out
-
-def diff_with_values(ddl1, ddl2):
-    changes = diff_line_pairs(ddl1, ddl2)
-    detailed = []
-
-    for typ, old, new in changes:
-        if typ == 'REPLACE' and old and new:
-            detailed.append((typ, old, new, word_level_changes(old, new)))
-        else:
-            detailed.append((typ, old, new, []))
-
-    return detailed
+SELECT DBMS_METADATA.GET_DDL(object_type, object_name)
+FROM   user_objects
+WHERE  object_type IN (
+  'TABLE',
+  'VIEW',
+  'INDEX',
+  'SEQUENCE',
+  'PROCEDURE',
+  'FUNCTION',
+  'PACKAGE',
+  'PACKAGE BODY',
+  'TRIGGER',
+  'TYPE'
+)
+ORDER BY object_type, object_name;
