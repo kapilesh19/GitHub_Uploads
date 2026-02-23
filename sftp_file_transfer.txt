@@ -1,0 +1,523 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+SFTP File Transfer Script
+Compatible with Python 2.7.5
+Authentication: Username + Password via pexpect
+
+Description:
+    1. Reads file transfer definitions from files.csv
+    2. Reads server credentials (server, port, username, password) from creds.csv
+    3. For each row:
+       a. Checks if source file exists on src server
+       b. Checks if file already exists on target server
+       c. If exists on target -> renames it to <filename>_<YYYYMMDD>.<ext>
+       d. Copies file from src server -> local temp -> tgt server
+    4. Writes a timestamped summary CSV and .log file
+
+Usage:
+    python sftp_file_transfer.py
+
+files.csv columns : src_server, src_path, src_filename, tgt_server, tgt_path
+creds.csv columns : server_name, port, username, password
+
+Example files.csv:
+    src_server,src_path,src_filename,tgt_server,tgt_path
+    server1,/data/in,report.csv,server2,/data/out
+
+Example creds.csv:
+    server_name,port,username,password
+    server1,22,user1,pass1
+    server2,22,user2,pass2
+"""
+
+import csv
+import os
+import sys
+import logging
+import tempfile
+from datetime import datetime
+import pexpect
+
+# ─────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────
+FILES_CSV   = '.csv'
+CREDS_CSV   = 'creds.csv'
+TIMESTAMP   = datetime.now().strftime('%Y%m%d_%H%M%S')
+SUMMARY_CSV = 'summary_{}.csv'.format(TIMESTAMP)
+LOG_FILE    = 'sftp_transfer_{}.log'.format(TIMESTAMP)
+TODAY       = datetime.now().strftime('%Y%m%d')
+
+# Timeout in seconds for each sftp/scp operation
+CMD_TIMEOUT = 60
+
+# ─────────────────────────────────────────────
+#  Logging: console + file
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE)
+    ]
+)
+log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+#  Load credentials
+#  Returns dict keyed by lowercase server name
+# ─────────────────────────────────────────────
+def load_credentials(creds_csv):
+    creds = {}
+    with open(creds_csv, 'rb') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            key = row['server_name'].lower()
+            creds[key] = {
+                'port':     row.get('port', '22'),
+                'username': row['username'],
+                'password': row['password'],
+            }
+    return creds
+
+
+# ─────────────────────────────────────────────
+#  pexpect patterns used across all functions
+# ─────────────────────────────────────────────
+# Prompts we might see during connection
+_CONN_PATTERNS = [
+    'assword:',                        # 0 password prompt
+    'yes/no',                          # 1 new host key confirmation
+    pexpect.EOF,                       # 2 connection closed unexpectedly
+    pexpect.TIMEOUT,                   # 3 timed out
+]
+
+# sftp interactive prompt after login
+_SFTP_PROMPT  = 'sftp> '
+_SFTP_PATTERNS = [
+    _SFTP_PROMPT,
+    pexpect.EOF,
+    pexpect.TIMEOUT,
+]
+
+
+# ─────────────────────────────────────────────
+#  Open an interactive sftp session
+#  Returns pexpect child, or None on failure
+# ─────────────────────────────────────────────
+def _open_sftp_session(server, creds_entry):
+    port     = creds_entry['port']
+    username = creds_entry['username']
+    password = creds_entry['password']
+
+    cmd = ('sftp -o StrictHostKeyChecking=no '
+           '-o ConnectTimeout=30 '
+           '-P {port} {user}@{host}').format(
+               port=port, user=username, host=server)
+
+    log.debug('Spawning: {}'.format(cmd))
+    try:
+        child = pexpect.spawn(cmd, timeout=CMD_TIMEOUT)
+    except Exception as e:
+        log.error('Failed to spawn sftp to {}: {}'.format(server, e))
+        return None
+
+    idx = child.expect(_CONN_PATTERNS)
+
+    if idx == 1:
+        # Accept new host key
+        child.sendline('yes')
+        idx = child.expect(_CONN_PATTERNS)
+
+    if idx == 0:
+        # Send password
+        child.sendline(password)
+        idx2 = child.expect(_SFTP_PATTERNS)
+        if idx2 == 0:
+            log.debug('SFTP session open: {}'.format(server))
+            return child
+        else:
+            log.error('SFTP login failed for {}: did not get prompt after password'.format(server))
+            child.close(force=True)
+            return None
+
+    log.error('SFTP connection failed for {} (idx={}): {}'.format(server, idx, child.before))
+    child.close(force=True)
+    return None
+
+
+# ─────────────────────────────────────────────
+#  Run a single command in an open sftp session
+#  Returns the output text from that command
+# ─────────────────────────────────────────────
+def _sftp_run(child, command):
+    child.sendline(command)
+    child.expect(_SFTP_PATTERNS)
+    return child.before.decode('utf-8', errors='replace') if isinstance(child.before, bytes) \
+           else child.before
+
+
+# ─────────────────────────────────────────────
+#  Close sftp session cleanly
+# ─────────────────────────────────────────────
+def _close_sftp(child):
+    try:
+        child.sendline('bye')
+        child.expect(pexpect.EOF, timeout=10)
+    except Exception:
+        pass
+    finally:
+        child.close(force=True)
+
+
+# ─────────────────────────────────────────────
+#  Check remote file existence and get size
+#  Returns size in bytes (int) or None
+# ─────────────────────────────────────────────
+def remote_file_info(server, creds_entry, remote_path):
+    child = _open_sftp_session(server, creds_entry)
+    if child is None:
+        return None
+    try:
+        output = _sftp_run(child, 'ls -l {}'.format(remote_path))
+        # sftp ls -l line: "-rw-r--r-- 1 user group 12345 Jan 01 12:00 file.csv"
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith('-'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        pass
+        return None
+    finally:
+        _close_sftp(child)
+
+
+# ─────────────────────────────────────────────
+#  Rename a file on a remote server
+#  Silently removes dst first (overwrite)
+#  Returns True on success
+# ─────────────────────────────────────────────
+def remote_rename(server, creds_entry, src_path, dst_path):
+    child = _open_sftp_session(server, creds_entry)
+    if child is None:
+        return False
+    try:
+        # Attempt to remove destination first — ignore errors
+        _sftp_run(child, '-rm {}'.format(dst_path))
+        # Rename
+        output = _sftp_run(child, 'rename {} {}'.format(src_path, dst_path))
+        if 'no such file' in output.lower() or 'error' in output.lower() \
+                or 'failure' in output.lower():
+            log.error('Rename error on {}: {}'.format(server, output.strip()))
+            return False
+        log.info('Renamed on {}: {} -> {}'.format(
+            server, os.path.basename(src_path), os.path.basename(dst_path)))
+        return True
+    finally:
+        _close_sftp(child)
+
+
+# ─────────────────────────────────────────────
+#  Pull a file from a remote server to local
+#  Uses pexpect to drive scp with password
+#  Returns True on success
+# ─────────────────────────────────────────────
+def _scp_pull(server, creds_entry, remote_path, local_path):
+    port     = creds_entry['port']
+    username = creds_entry['username']
+    password = creds_entry['password']
+
+    cmd = ('scp -o StrictHostKeyChecking=no '
+           '-o ConnectTimeout=30 '
+           '-P {port} {user}@{host}:{rpath} {lpath}').format(
+               port=port, user=username, host=server,
+               rpath=remote_path, lpath=local_path)
+
+    log.debug('SCP pull: {}'.format(cmd))
+    try:
+        child = pexpect.spawn(cmd, timeout=CMD_TIMEOUT)
+    except Exception as e:
+        log.error('Failed to spawn scp pull: {}'.format(e))
+        return False
+
+    idx = child.expect(['assword:', 'yes/no', pexpect.EOF, pexpect.TIMEOUT])
+    if idx == 1:
+        child.sendline('yes')
+        idx = child.expect(['assword:', pexpect.EOF, pexpect.TIMEOUT])
+
+    if idx == 0:
+        child.sendline(password)
+        child.expect(pexpect.EOF, timeout=CMD_TIMEOUT)
+        child.close()
+        if child.exitstatus == 0:
+            return True
+        log.error('SCP pull failed (exit={}): {}'.format(
+            child.exitstatus,
+            child.before.decode('utf-8', errors='replace') if child.before else ''))
+        return False
+
+    log.error('SCP pull: unexpected prompt (idx={})'.format(idx))
+    child.close(force=True)
+    return False
+
+
+# ─────────────────────────────────────────────
+#  Push a local file to a remote server
+#  Uses pexpect to drive scp with password
+#  Returns True on success
+# ─────────────────────────────────────────────
+def _scp_push(local_path, server, creds_entry, remote_path):
+    port     = creds_entry['port']
+    username = creds_entry['username']
+    password = creds_entry['password']
+
+    cmd = ('scp -o StrictHostKeyChecking=no '
+           '-o ConnectTimeout=30 '
+           '-P {port} {lpath} {user}@{host}:{rpath}').format(
+               port=port, lpath=local_path,
+               user=username, host=server, rpath=remote_path)
+
+    log.debug('SCP push: {}'.format(cmd))
+    try:
+        child = pexpect.spawn(cmd, timeout=CMD_TIMEOUT)
+    except Exception as e:
+        log.error('Failed to spawn scp push: {}'.format(e))
+        return False
+
+    idx = child.expect(['assword:', 'yes/no', pexpect.EOF, pexpect.TIMEOUT])
+    if idx == 1:
+        child.sendline('yes')
+        idx = child.expect(['assword:', pexpect.EOF, pexpect.TIMEOUT])
+
+    if idx == 0:
+        child.sendline(password)
+        child.expect(pexpect.EOF, timeout=CMD_TIMEOUT)
+        child.close()
+        if child.exitstatus == 0:
+            return True
+        log.error('SCP push failed (exit={}): {}'.format(
+            child.exitstatus,
+            child.before.decode('utf-8', errors='replace') if child.before else ''))
+        return False
+
+    log.error('SCP push: unexpected prompt (idx={})'.format(idx))
+    child.close(force=True)
+    return False
+
+
+# ─────────────────────────────────────────────
+#  Copy file: SRC server -> local temp -> TGT
+#  Returns True on success
+# ─────────────────────────────────────────────
+def copy_file(src_server, src_creds, src_path,
+              tgt_server, tgt_creds, tgt_path):
+
+    tmp_file = tempfile.mktemp(suffix='_xfer')
+    try:
+        log.info('  Pulling from SRC {}:{}'.format(src_server, src_path))
+        if not _scp_pull(src_server, src_creds, src_path, tmp_file):
+            return False
+
+        log.info('  Pushing to TGT {}:{}'.format(tgt_server, tgt_path))
+        if not _scp_push(tmp_file, tgt_server, tgt_creds, tgt_path):
+            return False
+
+        return True
+    finally:
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+            log.debug('  Temp file removed: {}'.format(tmp_file))
+
+
+# ─────────────────────────────────────────────
+#  Build backup filename
+#  report.csv  ->  report_20240315.csv
+# ─────────────────────────────────────────────
+def build_backup_name(filename):
+    if '.' in filename:
+        name, ext = filename.rsplit('.', 1)
+        return '{}_{}.{}'.format(name, TODAY, ext)
+    return '{}_{}'.format(filename, TODAY)
+
+
+def bytes_to_kb(size_bytes):
+    if size_bytes is None:
+        return 'N/A'
+    return '{:.2f}'.format(size_bytes / 1024.0)
+
+
+# ─────────────────────────────────────────────
+#  Main processing loop
+# ─────────────────────────────────────────────
+def process_transfers(files_csv, creds):
+    summary_rows = []
+
+    with open(files_csv, 'rb') as f:
+        rows = list(csv.DictReader(f))
+
+    log.info('Total rows to process: {}'.format(len(rows)))
+
+    for idx, row in enumerate(rows, start=1):
+        row = {k.strip(): v.strip() for k, v in row.items()}
+
+        src_server   = row['src_server']
+        src_path     = row['src_path'].rstrip('/')
+        src_filename = row['src_filename']
+        tgt_server   = row['tgt_server']
+        tgt_path     = row['tgt_path'].rstrip('/')
+
+        src_full = '{}/{}'.format(src_path, src_filename)
+        tgt_full = '{}/{}'.format(tgt_path, src_filename)
+        bak_name = build_backup_name(src_filename)
+        bak_full = '{}/{}'.format(tgt_path, bak_name)
+
+        log.info('─' * 60)
+        log.info('[{}/{}] {}'.format(idx, len(rows), src_filename))
+        log.info('  SRC : {}:{}'.format(src_server, src_full))
+        log.info('  TGT : {}:{}'.format(tgt_server, tgt_full))
+
+        rec = {
+            'filename':               src_filename,
+            'available_in_src':       'No',
+            'available_in_tgt':       'No',
+            'backup_filename_in_tgt': 'N/A',
+            'file_copied_src_to_tgt': 'No',
+            'src_file_size_kb':       'N/A',
+            'tgt_file_size_kb':       'N/A',
+            'backed_up_file_size_kb': 'N/A',
+        }
+
+        # Validate credentials exist
+        src_key = src_server.lower()
+        tgt_key = tgt_server.lower()
+
+        if src_key not in creds:
+            log.error('No credentials for SRC server: {}'.format(src_server))
+            summary_rows.append(rec)
+            continue
+
+        if tgt_key not in creds:
+            log.error('No credentials for TGT server: {}'.format(tgt_server))
+            summary_rows.append(rec)
+            continue
+
+        src_creds = creds[src_key]
+        tgt_creds = creds[tgt_key]
+
+        # ── 1. Check source file ─────────────────────────────────
+        log.info('  Checking SRC file...')
+        src_size = remote_file_info(src_server, src_creds, src_full)
+        if src_size is None:
+            log.warning('  Source file NOT found: {}:{}'.format(src_server, src_full))
+            summary_rows.append(rec)
+            continue
+
+        rec['available_in_src'] = 'Yes'
+        rec['src_file_size_kb'] = bytes_to_kb(src_size)
+        log.info('  SRC found. Size: {} KB'.format(rec['src_file_size_kb']))
+
+        # ── 2. Check target file ─────────────────────────────────
+        log.info('  Checking TGT file...')
+        tgt_size = remote_file_info(tgt_server, tgt_creds, tgt_full)
+
+        if tgt_size is not None:
+            rec['available_in_tgt'] = 'Yes'
+            rec['tgt_file_size_kb'] = bytes_to_kb(tgt_size)
+            log.info('  TGT exists. Size: {} KB. Renaming -> {}'.format(
+                rec['tgt_file_size_kb'], bak_name))
+
+            # ── 3. Rename existing TGT file ──────────────────────
+            if remote_rename(tgt_server, tgt_creds, tgt_full, bak_full):
+                bak_size = remote_file_info(tgt_server, tgt_creds, bak_full)
+                rec['backup_filename_in_tgt'] = bak_name
+                rec['backed_up_file_size_kb'] = bytes_to_kb(bak_size)
+            else:
+                rec['backup_filename_in_tgt'] = 'Rename failed'
+                summary_rows.append(rec)
+                continue
+        else:
+            rec['available_in_tgt']       = 'No'
+            rec['backup_filename_in_tgt'] = 'File missing in tgt'
+            log.info('  No existing file on TGT. Skipping rename.')
+
+        # ── 4. Copy SRC -> TGT ───────────────────────────────────
+        log.info('  Copying file...')
+        copied = copy_file(src_server, src_creds, src_full,
+                           tgt_server, tgt_creds, tgt_full)
+
+        if copied:
+            new_tgt_size = remote_file_info(tgt_server, tgt_creds, tgt_full)
+            rec['file_copied_src_to_tgt'] = 'Yes'
+            rec['tgt_file_size_kb']       = bytes_to_kb(new_tgt_size)
+            log.info('  Copy SUCCESS. TGT size: {} KB'.format(rec['tgt_file_size_kb']))
+        else:
+            rec['file_copied_src_to_tgt'] = 'No'
+            log.error('  Copy FAILED for: {}'.format(src_filename))
+
+        summary_rows.append(rec)
+
+    return summary_rows
+
+
+# ─────────────────────────────────────────────
+#  Write summary CSV
+# ─────────────────────────────────────────────
+def write_summary(summary_rows, output_csv):
+    fieldnames = [
+        'filename',
+        'available_in_src',
+        'available_in_tgt',
+        'backup_filename_in_tgt',
+        'file_copied_src_to_tgt',
+        'src_file_size_kb',
+        'tgt_file_size_kb',
+        'backed_up_file_size_kb',
+    ]
+    with open(output_csv, 'wb') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow(row)
+    log.info('Summary written: {}'.format(output_csv))
+
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    log.info('=' * 60)
+    log.info('SFTP File Transfer Script  |  Python {}'.format(sys.version.split()[0]))
+    log.info('Run date: {}'.format(TODAY))
+    log.info('=' * 60)
+
+    # Validate input files
+    for fpath in [FILES_CSV, CREDS_CSV]:
+        if not os.path.isfile(fpath):
+            log.error('Input file not found: {}'.format(fpath))
+            sys.exit(1)
+
+    creds = load_credentials(CREDS_CSV)
+    log.info('Credentials loaded for: {}'.format(', '.join(creds.keys())))
+
+    summary = process_transfers(FILES_CSV, creds)
+    write_summary(summary, SUMMARY_CSV)
+
+    total   = len(summary)
+    copied  = sum(1 for r in summary if r['file_copied_src_to_tgt'] == 'Yes')
+    backed  = sum(1 for r in summary if r['backup_filename_in_tgt'] not in
+                  ('N/A', 'File missing in tgt', 'Rename failed'))
+    missing = sum(1 for r in summary if r['available_in_src'] == 'No')
+
+    log.info('=' * 60)
+    log.info('RESULTS  Total={} | Copied={} | Backed up={} | Src missing={} | Failed={}'.format(
+        total, copied, backed, missing, total - copied))
+    log.info('Summary : {}'.format(SUMMARY_CSV))
+    log.info('Log     : {}'.format(LOG_FILE))
+    log.info('=' * 60)
