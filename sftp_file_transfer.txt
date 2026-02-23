@@ -14,9 +14,20 @@ Description:
        c. If exists on target -> renames it to <filename>_<YYYYMMDD>.<ext>
        d. Copies file from src server -> local temp -> tgt server
     4. Writes a timestamped summary CSV and .log file
+       (summary and log are written to the same folder as the input files)
 
 Usage:
-    python sftp_file_transfer.py
+    python sftp_file_transfer.py --folder /path/to/input/folder
+
+    or using short form:
+    python sftp_file_transfer.py -f /path/to/input/folder
+
+Arguments:
+    --folder / -f   Path to the folder containing files.csv and creds.csv
+                    The summary CSV and log file will also be written here.
+
+Example:
+    python sftp_file_transfer.py --folder /home/user/sftp_jobs
 
 files.csv columns : src_server, src_path, src_filename, tgt_server, tgt_path
 creds.csv columns : server_name, port, username, password
@@ -37,32 +48,59 @@ import sys
 import logging
 import tempfile
 from datetime import datetime
+import argparse
+
 import pexpect
 
 # ─────────────────────────────────────────────
-#  Configuration
+#  Parse command-line arguments
 # ─────────────────────────────────────────────
-FILES_CSV   = '.csv'
-CREDS_CSV   = 'creds.csv'
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='SFTP File Transfer Script - Python 2.7.5'
+    )
+    parser.add_argument(
+        '--folder', '-f',
+        required=True,
+        help='Path to the folder containing files.csv and creds.csv. '
+             'Summary CSV and log file will also be written here.'
+    )
+    return parser.parse_args()
+
+
+# ─────────────────────────────────────────────
+#  Configuration — paths resolved at runtime
+#  from the --folder argument
+# ─────────────────────────────────────────────
 TIMESTAMP   = datetime.now().strftime('%Y%m%d_%H%M%S')
-SUMMARY_CSV = 'summary_{}.csv'.format(TIMESTAMP)
-LOG_FILE    = 'sftp_transfer_{}.log'.format(TIMESTAMP)
 TODAY       = datetime.now().strftime('%Y%m%d')
+
+# These are set dynamically in __main__ after parsing args
+FILES_CSV   = None
+CREDS_CSV   = None
+SUMMARY_CSV = None
+LOG_FILE    = None
 
 # Timeout in seconds for each sftp/scp operation
 CMD_TIMEOUT = 60
 
 # ─────────────────────────────────────────────
-#  Logging: console + file
+#  Logging setup — called after args are parsed
+#  so the log file path is known
 # ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE)
-    ]
-)
+def setup_logging(log_file):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file)
+        ]
+    )
+    return logging.getLogger(__name__)
+
+
+# Placeholder — replaced in __main__ after arg parsing
 log = logging.getLogger(__name__)
 
 
@@ -492,20 +530,47 @@ def write_summary(summary_rows, output_csv):
 #  Entry point
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
+
+    # ── Step 1: Parse the --folder argument ─────────────────────
+    args = parse_args()
+    FOLDER = os.path.abspath(args.folder)
+
+    # ── Step 2: Validate the folder exists ──────────────────────
+    if not os.path.isdir(FOLDER):
+        print('ERROR: Folder not found: {}'.format(FOLDER))
+        sys.exit(1)
+
+    # ── Step 3: Build all file paths from the folder ────────────
+    FILES_CSV   = os.path.join(FOLDER, 'files.csv')
+    CREDS_CSV   = os.path.join(FOLDER, 'creds.csv')
+    SUMMARY_CSV = os.path.join(FOLDER, 'summary_{}.csv'.format(TIMESTAMP))
+    LOG_FILE    = os.path.join(FOLDER, 'sftp_transfer_{}.log'.format(TIMESTAMP))
+
+    # ── Step 4: Setup logging now that log path is known ────────
+    log = setup_logging(LOG_FILE)
+
     log.info('=' * 60)
     log.info('SFTP File Transfer Script  |  Python {}'.format(sys.version.split()[0]))
-    log.info('Run date: {}'.format(TODAY))
+    log.info('Run date   : {}'.format(TODAY))
+    log.info('Input folder: {}'.format(FOLDER))
     log.info('=' * 60)
 
-    # Validate input files
+    # ── Step 5: Validate input CSV files exist ───────────────────
     for fpath in [FILES_CSV, CREDS_CSV]:
         if not os.path.isfile(fpath):
             log.error('Input file not found: {}'.format(fpath))
             sys.exit(1)
 
+    log.info('files.csv : {}'.format(FILES_CSV))
+    log.info('creds.csv : {}'.format(CREDS_CSV))
+    log.info('summary   : {}'.format(SUMMARY_CSV))
+    log.info('log file  : {}'.format(LOG_FILE))
+
+    # ── Step 6: Load credentials ─────────────────────────────────
     creds = load_credentials(CREDS_CSV)
     log.info('Credentials loaded for: {}'.format(', '.join(creds.keys())))
 
+    # ── Step 7: Process transfers ─────────────────────────────────
     summary = process_transfers(FILES_CSV, creds)
     write_summary(summary, SUMMARY_CSV)
 
