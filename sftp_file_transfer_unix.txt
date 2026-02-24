@@ -3,14 +3,19 @@
 #  SFTP File Transfer Script
 #  Usage : ./sftp_transfer.sh --folder /path/to/folder
 #
+#  No sshpass or expect required.
+#  Password is prompted naturally by sftp for each connection.
+#
 #  Folder must contain:
 #    files.csv : src_server,src_path,src_filename,tgt_server,tgt_path
-#    creds.csv : server_name,port,username,password
+#    creds.csv : server_name,port,username
+#    (no password column needed in creds.csv)
 #
 #  Output files generated in same folder:
-#    cmds_src_<filename>.txt
-#    cmds_tgt_<filename>.txt
-#    cmds_tgt_rename_<filename>.txt
+#    cmds_src_<filename>.txt          check src + get file
+#    cmds_tgt_<filename>.txt          check tgt file exists
+#    cmds_tgt_rename_<filename>.txt   rename existing tgt file
+#    cmds_tgt_put_<filename>.txt      put file to tgt
 #    summary_<YYYYMMDD_HHMMSS>.csv
 #    sftp_transfer_<YYYYMMDD_HHMMSS>.log
 # =============================================================
@@ -75,7 +80,7 @@ if [[ ! -f "$CREDS_CSV" ]]; then
 fi
 
 # ─────────────────────────────────────────────
-#  Log function
+#  Log function — writes to console and log file
 # ─────────────────────────────────────────────
 log() {
     local msg="$(date '+%Y-%m-%d %H:%M:%S') [$1] $2"
@@ -85,8 +90,8 @@ log() {
 
 # ─────────────────────────────────────────────
 #  Get a field from creds.csv for a server
-#  Usage: get_cred <server> <field>
-#  Field: port=2, username=3, password=4
+#  Usage : get_cred <server> <field>
+#  Fields: port=2  username=3
 # ─────────────────────────────────────────────
 get_cred() {
     local search_server=$(echo "$1" | tr '[:upper:]' '[:lower:]')
@@ -96,66 +101,23 @@ get_cred() {
     case "$field" in
         port)     col=2 ;;
         username) col=3 ;;
-        password) col=4 ;;
     esac
 
-    # Read creds.csv line by line skipping header
     local first=1
-    while IFS=',' read -r srv p u pw; do
+    while IFS=',' read -r srv p u; do
         if [[ $first -eq 1 ]]; then
             first=0
             continue
         fi
-        # Trim whitespace
-        srv=$(echo "$srv" | tr -d ' ')
-        srv=$(echo "$srv" | tr '[:upper:]' '[:lower:]')
-
+        srv=$(echo "$srv" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
         if [[ "$srv" == "$search_server" ]]; then
             case "$col" in
-                2) echo $(echo "$p"  | tr -d ' ') ;;
-                3) echo $(echo "$u"  | tr -d ' ') ;;
-                4) echo $(echo "$pw" | tr -d ' ') ;;
+                2) echo $(echo "$p" | tr -d ' ') ;;
+                3) echo $(echo "$u" | tr -d ' ') ;;
             esac
             return
         fi
     done < "$CREDS_CSV"
-}
-
-# ─────────────────────────────────────────────
-#  Password cache — avoids prompting twice
-#  for the same server
-# ─────────────────────────────────────────────
-declare -A PWD_CACHE
-
-get_password() {
-    local server=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-
-    # Return cached if already known
-    if [[ -n "${PWD_CACHE[$server]}" ]]; then
-        echo "${PWD_CACHE[$server]}"
-        return
-    fi
-
-    # Try creds.csv first
-    local pwd_csv
-    pwd_csv=$(get_cred "$server" "password")
-
-    if [[ -n "$pwd_csv" ]]; then
-        PWD_CACHE[$server]="$pwd_csv"
-        echo "$pwd_csv"
-        return
-    fi
-
-    # Not in CSV — prompt user
-    local user
-    user=$(get_cred "$server" "username")
-    local entered
-    echo "" >&2
-    read -r -s -p "Enter password for server [$server] username [$user]: " entered >&2
-    echo "" >&2
-
-    PWD_CACHE[$server]="$entered"
-    echo "$entered"
 }
 
 # ─────────────────────────────────────────────
@@ -164,79 +126,13 @@ get_password() {
 # ─────────────────────────────────────────────
 build_backup_name() {
     local filename="$1"
-    local name="${filename%.*}"
-    local ext="${filename##*.}"
-
     if [[ "$filename" == *.* ]]; then
+        local name="${filename%.*}"
+        local ext="${filename##*.}"
         echo "${name}_${TODAY}.${ext}"
     else
         echo "${filename}_${TODAY}"
     fi
-}
-
-# ─────────────────────────────────────────────
-#  Check if remote file exists
-#  Generates cmds file, runs sftp, checks output
-#  Returns 0 if exists, 1 if not
-# ─────────────────────────────────────────────
-check_remote_file() {
-    local server="$1"
-    local port="$2"
-    local user="$3"
-    local password="$4"
-    local remote_path="$5"
-    local cmds_file="$6"
-
-    # Generate the cmds file
-    echo "ls -l $remote_path" >  "$cmds_file"
-    echo "bye"                >> "$cmds_file"
-
-    log "INFO" "  Generated: $cmds_file"
-
-    # Run sftp and capture output
-    local output
-    output=$(sshpass -p "$password" sftp \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=10 \
-        -P "$port" \
-        -b "$cmds_file" \
-        "${user}@${server}" 2>/dev/null)
-
-    # If output contains a line starting with "-" it is a file entry
-    echo "$output" | grep "^-" > /dev/null 2>&1
-    return $?
-}
-
-# ─────────────────────────────────────────────
-#  Get remote file size in bytes from sftp output
-#  Runs sftp ls -l and extracts 5th field (size)
-# ─────────────────────────────────────────────
-get_remote_size() {
-    local server="$1"
-    local port="$2"
-    local user="$3"
-    local password="$4"
-    local remote_path="$5"
-    local tmp_cmds="$TMP_DIR/cmds_size_$$.txt"
-
-    echo "ls -l $remote_path" >  "$tmp_cmds"
-    echo "bye"                >> "$tmp_cmds"
-
-    local output
-    output=$(sshpass -p "$password" sftp \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=10 \
-        -P "$port" \
-        -b "$tmp_cmds" \
-        "${user}@${server}" 2>/dev/null)
-
-    rm -f "$tmp_cmds"
-
-    # Extract size — 5th field of the ls -l line starting with "-"
-    local size_line
-    size_line=$(echo "$output" | grep "^-")
-    # Use cut to get 5th field (size in bytes)
-    echo "$size_line" | tr -s ' ' | cut -d' ' -f5
 }
 
 # ─────────────────────────────────────────────
@@ -252,104 +148,89 @@ bytes_to_kb() {
 }
 
 # ─────────────────────────────────────────────
-#  Rename file on remote server
-#  Generates cmds_tgt_rename file and runs sftp
+#  Run sftp with a cmds file
+#  sftp naturally prompts for password
+#  Usage : run_sftp <user> <server> <port> <cmds_file>
 #  Returns 0 on success, 1 on failure
 # ─────────────────────────────────────────────
-rename_remote_file() {
-    local server="$1"
-    local port="$2"
-    local user="$3"
-    local password="$4"
-    local src_path="$5"
-    local dst_path="$6"
-    local cmds_file="$7"
+run_sftp() {
+    local user="$1"
+    local server="$2"
+    local port="$3"
+    local cmds_file="$4"
 
-    # Generate the rename cmds file
-    echo "-rm $dst_path"          >  "$cmds_file"
-    echo "rename $src_path $dst_path" >> "$cmds_file"
-    echo "bye"                    >> "$cmds_file"
-
-    log "INFO" "  Generated: $cmds_file"
-
-    sshpass -p "$password" sftp \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=30 \
-        -P "$port" \
-        -b "$cmds_file" \
-        "${user}@${server}" >> "$LOG_FILE" 2>&1
+    sftp -o StrictHostKeyChecking=no \
+         -o ConnectTimeout=30 \
+         -P "$port" \
+         -b "$cmds_file" \
+         "${user}@${server}"
 
     return $?
 }
 
 # ─────────────────────────────────────────────
-#  Copy file SRC -> local temp -> TGT
-#  Returns 0 on success, 1 on failure
+#  Check if remote file exists
+#  Generates cmds file with ls -l
+#  Runs sftp and checks output for a file entry
+#  Returns 0 if file exists, 1 if not
 # ─────────────────────────────────────────────
-copy_file() {
-    local src_server="$1"
-    local src_port="$2"
-    local src_user="$3"
-    local src_password="$4"
-    local src_path="$5"
-    local tgt_server="$6"
-    local tgt_port="$7"
-    local tgt_user="$8"
-    local tgt_password="$9"
-    local tgt_path="${10}"
-    local tmp_file="$TMP_DIR/xfer_$$.tmp"
+check_remote_file() {
+    local user="$1"
+    local server="$2"
+    local port="$3"
+    local remote_path="$4"
+    local cmds_file="$5"
 
-    # Pull from SRC to local temp
-    log "INFO" "  Pulling from SRC ${src_server}:${src_path}"
-    sshpass -p "$src_password" scp \
+    # Generate cmds file
+    echo "ls -l $remote_path" >  "$cmds_file"
+    echo "bye"                >> "$cmds_file"
+
+    log "INFO" "  Generated: $cmds_file"
+
+    # Run sftp — password prompted here
+    local output
+    output=$(sftp \
         -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=30 \
-        -P "$src_port" \
-        "${src_user}@${src_server}:${src_path}" \
-        "$tmp_file" >> "$LOG_FILE" 2>&1
+        -o ConnectTimeout=10 \
+        -P "$port" \
+        -b "$cmds_file" \
+        "${user}@${server}" 2>/dev/null)
 
-    if [[ $? -ne 0 ]]; then
-        log "ERROR" "  SCP pull failed from $src_server"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    # Push from local temp to TGT
-    log "INFO" "  Pushing to TGT ${tgt_server}:${tgt_path}"
-    sshpass -p "$tgt_password" scp \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=30 \
-        -P "$tgt_port" \
-        "$tmp_file" \
-        "${tgt_user}@${tgt_server}:${tgt_path}" >> "$LOG_FILE" 2>&1
-
-    if [[ $? -ne 0 ]]; then
-        log "ERROR" "  SCP push failed to $tgt_server"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    rm -f "$tmp_file"
-    return 0
+    # A line starting with "-" means a regular file was found
+    echo "$output" | grep "^-" > /dev/null 2>&1
+    return $?
 }
 
 # ─────────────────────────────────────────────
-#  Initialise summary CSV with header
+#  Get remote file size in bytes
+#  Runs sftp ls -l and extracts size with cut
 # ─────────────────────────────────────────────
-echo "filename,available_in_src,available_in_tgt,backup_filename_in_tgt,file_copied_src_to_tgt,src_file_size_kb,tgt_file_size_kb,backed_up_file_size_kb" \
-    > "$SUMMARY_CSV"
+get_remote_size() {
+    local user="$1"
+    local server="$2"
+    local port="$3"
+    local remote_path="$4"
+    local tmp_cmds="$TMP_DIR/cmds_size_$$.txt"
 
-# ─────────────────────────────────────────────
-#  Counters
-# ─────────────────────────────────────────────
-TOTAL=0
-COPIED=0
-BACKED=0
-MISSING=0
-FAILED=0
+    echo "ls -l $remote_path" >  "$tmp_cmds"
+    echo "bye"                >> "$tmp_cmds"
+
+    local output
+    output=$(sftp \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=10 \
+        -P "$port" \
+        -b "$tmp_cmds" \
+        "${user}@${server}" 2>/dev/null)
+
+    rm -f "$tmp_cmds"
+
+    # Get the file line, collapse spaces, cut 5th field (size)
+    echo "$output" | grep "^-" | tr -s ' ' | cut -d' ' -f5
+}
 
 # =============================================================
-#  MAIN LOOP — read files.csv line by line
+#  MAIN
 # =============================================================
 log "INFO" "============================================================"
 log "INFO" "SFTP File Transfer Script"
@@ -357,6 +238,16 @@ log "INFO" "Run date : $TODAY"
 log "INFO" "Folder   : $FOLDER"
 log "INFO" "============================================================"
 
+# Write summary CSV header
+echo "filename,available_in_src,available_in_tgt,backup_filename_in_tgt,file_copied_src_to_tgt,src_file_size_kb,tgt_file_size_kb,backed_up_file_size_kb" \
+    > "$SUMMARY_CSV"
+
+# Counters
+TOTAL=0; COPIED=0; BACKED=0; MISSING=0; FAILED=0
+
+# ─────────────────────────────────────────────
+#  Read files.csv line by line
+# ─────────────────────────────────────────────
 first_line=1
 while IFS=',' read -r src_server src_path src_filename tgt_server tgt_path; do
 
@@ -366,12 +257,12 @@ while IFS=',' read -r src_server src_path src_filename tgt_server tgt_path; do
         continue
     fi
 
-    # Trim whitespace from all fields
-    src_server=$(echo  "$src_server"  | tr -d ' ')
-    src_path=$(echo    "$src_path"    | tr -d ' ')
+    # Trim whitespace
+    src_server=$(echo "$src_server"   | tr -d ' ')
+    src_path=$(echo "$src_path"       | tr -d ' ')
     src_filename=$(echo "$src_filename" | tr -d ' ')
-    tgt_server=$(echo  "$tgt_server"  | tr -d ' ')
-    tgt_path=$(echo    "$tgt_path"    | tr -d ' ')
+    tgt_server=$(echo "$tgt_server"   | tr -d ' ')
+    tgt_path=$(echo "$tgt_path"       | tr -d ' ')
 
     # Remove trailing slash
     src_path="${src_path%/}"
@@ -388,86 +279,85 @@ while IFS=',' read -r src_server src_path src_filename tgt_server tgt_path; do
     CMDS_SRC="$TMP_DIR/cmds_src_${src_filename}.txt"
     CMDS_TGT="$TMP_DIR/cmds_tgt_${src_filename}.txt"
     CMDS_TGT_RENAME="$TMP_DIR/cmds_tgt_rename_${src_filename}.txt"
+    CMDS_TGT_PUT="$TMP_DIR/cmds_tgt_put_${src_filename}.txt"
+    TMP_FILE="$TMP_DIR/xfer_${src_filename}.tmp"
 
-    log "INFO" "────────────────────────────────────────────────────────────"
+    log "INFO" "────────────────────────────────────────────────────────"
     log "INFO" "[$TOTAL] $src_filename"
     log "INFO" "  SRC : ${src_server}:${src_full}"
     log "INFO" "  TGT : ${tgt_server}:${tgt_full}"
 
     # Default summary values
-    avail_src="No"
-    avail_tgt="No"
-    backup_name="N/A"
-    copied_flag="No"
-    src_size_kb="N/A"
-    tgt_size_kb="N/A"
-    bak_size_kb="N/A"
+    avail_src="No";  avail_tgt="No"
+    backup_name="N/A"; copied_flag="No"
+    src_size_kb="N/A"; tgt_size_kb="N/A"; bak_size_kb="N/A"
 
     # ── Get credentials ──────────────────────────────────────
-    src_port=$(get_cred "$src_server" "port");     src_port=${src_port:-22}
+    src_port=$(get_cred "$src_server" "port");   src_port=${src_port:-22}
     src_user=$(get_cred "$src_server" "username")
-    tgt_port=$(get_cred "$tgt_server" "port");     tgt_port=${tgt_port:-22}
+    tgt_port=$(get_cred "$tgt_server" "port");   tgt_port=${tgt_port:-22}
     tgt_user=$(get_cred "$tgt_server" "username")
 
     if [[ -z "$src_user" ]]; then
         log "ERROR" "  No credentials for SRC: $src_server"
         echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
-        FAILED=$((FAILED + 1))
-        continue
+        FAILED=$((FAILED + 1)); continue
     fi
 
     if [[ -z "$tgt_user" ]]; then
         log "ERROR" "  No credentials for TGT: $tgt_server"
         echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
-        FAILED=$((FAILED + 1))
-        continue
+        FAILED=$((FAILED + 1)); continue
     fi
 
-    # ── Get passwords ─────────────────────────────────────────
-    src_password=$(get_password "$src_server")
-    tgt_password=$(get_password "$tgt_server")
-
-    # ── 1. Check SRC file ─────────────────────────────────────
+    # ── 1. Check SRC file — sftp prompts password ────────────
     log "INFO" "  Checking SRC file..."
-    check_remote_file "$src_server" "$src_port" "$src_user" "$src_password" "$src_full" "$CMDS_SRC"
+    log "INFO" "  Connecting to SRC: ${src_user}@${src_server}:${src_port}"
+    check_remote_file "$src_user" "$src_server" "$src_port" "$src_full" "$CMDS_SRC"
 
     if [[ $? -ne 0 ]]; then
         log "WARN" "  Source file NOT found: ${src_server}:${src_full}"
-        avail_src="No"
         MISSING=$((MISSING + 1))
         echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
         continue
     fi
 
     avail_src="Yes"
-    src_size=$(get_remote_size "$src_server" "$src_port" "$src_user" "$src_password" "$src_full")
+    src_size=$(get_remote_size "$src_user" "$src_server" "$src_port" "$src_full")
     src_size_kb=$(bytes_to_kb "$src_size")
     log "INFO" "  SRC found. Size: ${src_size_kb} KB"
 
-    # ── 2. Check TGT file ─────────────────────────────────────
+    # ── 2. Check TGT file — sftp prompts password ────────────
     log "INFO" "  Checking TGT file..."
-    check_remote_file "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" "$tgt_full" "$CMDS_TGT"
+    log "INFO" "  Connecting to TGT: ${tgt_user}@${tgt_server}:${tgt_port}"
+    check_remote_file "$tgt_user" "$tgt_server" "$tgt_port" "$tgt_full" "$CMDS_TGT"
 
     if [[ $? -eq 0 ]]; then
         avail_tgt="Yes"
-        tgt_size=$(get_remote_size "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" "$tgt_full")
+        tgt_size=$(get_remote_size "$tgt_user" "$tgt_server" "$tgt_port" "$tgt_full")
         tgt_size_kb=$(bytes_to_kb "$tgt_size")
         log "INFO" "  TGT exists. Size: ${tgt_size_kb} KB. Renaming -> $bak_name"
 
         # ── 3. Rename TGT file ────────────────────────────────
-        rename_remote_file "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" \
-            "$tgt_full" "$bak_full" "$CMDS_TGT_RENAME"
+        # Generate rename cmds file
+        echo "-rm $bak_full"          >  "$CMDS_TGT_RENAME"
+        echo "rename $tgt_full $bak_full" >> "$CMDS_TGT_RENAME"
+        echo "bye"                    >> "$CMDS_TGT_RENAME"
+
+        log "INFO" "  Generated: $CMDS_TGT_RENAME"
+        log "INFO" "  Connecting to TGT for rename: ${tgt_user}@${tgt_server}:${tgt_port}"
+
+        run_sftp "$tgt_user" "$tgt_server" "$tgt_port" "$CMDS_TGT_RENAME" >> "$LOG_FILE" 2>&1
 
         if [[ $? -ne 0 ]]; then
             log "ERROR" "  Rename failed on $tgt_server"
             backup_name="Rename failed"
             echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
-            FAILED=$((FAILED + 1))
-            continue
+            FAILED=$((FAILED + 1)); continue
         fi
 
         backup_name="$bak_name"
-        bak_size=$(get_remote_size "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" "$bak_full")
+        bak_size=$(get_remote_size "$tgt_user" "$tgt_server" "$tgt_port" "$bak_full")
         bak_size_kb=$(bytes_to_kb "$bak_size")
         BACKED=$((BACKED + 1))
         log "INFO" "  Rename success. Backup: $bak_name (${bak_size_kb} KB)"
@@ -478,23 +368,53 @@ while IFS=',' read -r src_server src_path src_filename tgt_server tgt_path; do
         log "INFO" "  No existing file on TGT. Skipping rename."
     fi
 
-    # ── 4. Copy SRC -> TGT ────────────────────────────────────
-    log "INFO" "  Copying file..."
-    copy_file \
-        "$src_server" "$src_port" "$src_user" "$src_password" "$src_full" \
-        "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" "$tgt_full"
+    # ── 4. Get file from SRC to local temp ───────────────────
+    log "INFO" "  Getting file from SRC..."
 
-    if [[ $? -eq 0 ]]; then
-        new_tgt_size=$(get_remote_size "$tgt_server" "$tgt_port" "$tgt_user" "$tgt_password" "$tgt_full")
+    # Generate cmds_src with get command
+    echo "get $src_full $TMP_FILE" >  "$CMDS_SRC"
+    echo "bye"                     >> "$CMDS_SRC"
+
+    log "INFO" "  Generated: $CMDS_SRC"
+    log "INFO" "  Connecting to SRC for get: ${src_user}@${src_server}:${src_port}"
+
+    run_sftp "$src_user" "$src_server" "$src_port" "$CMDS_SRC" >> "$LOG_FILE" 2>&1
+
+    if [[ $? -ne 0 ]] || [[ ! -f "$TMP_FILE" ]]; then
+        log "ERROR" "  GET failed from $src_server"
+        rm -f "$TMP_FILE"
+        echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
+        FAILED=$((FAILED + 1)); continue
+    fi
+
+    log "INFO" "  File pulled to local temp: $TMP_FILE"
+
+    # ── 5. Put file from local temp to TGT ───────────────────
+    log "INFO" "  Putting file to TGT..."
+
+    # Generate cmds_tgt_put with put command
+    echo "put $TMP_FILE $tgt_full" >  "$CMDS_TGT_PUT"
+    echo "bye"                     >> "$CMDS_TGT_PUT"
+
+    log "INFO" "  Generated: $CMDS_TGT_PUT"
+    log "INFO" "  Connecting to TGT for put: ${tgt_user}@${tgt_server}:${tgt_port}"
+
+    run_sftp "$tgt_user" "$tgt_server" "$tgt_port" "$CMDS_TGT_PUT" >> "$LOG_FILE" 2>&1
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "  PUT failed to $tgt_server"
+        rm -f "$TMP_FILE"
+        copied_flag="No"
+        FAILED=$((FAILED + 1))
+    else
+        new_tgt_size=$(get_remote_size "$tgt_user" "$tgt_server" "$tgt_port" "$tgt_full")
         tgt_size_kb=$(bytes_to_kb "$new_tgt_size")
         copied_flag="Yes"
         COPIED=$((COPIED + 1))
-        log "INFO" "  Copy SUCCESS. TGT size: ${tgt_size_kb} KB"
-    else
-        copied_flag="No"
-        FAILED=$((FAILED + 1))
-        log "ERROR" "  Copy FAILED for: $src_filename"
+        log "INFO" "  PUT SUCCESS. TGT size: ${tgt_size_kb} KB"
     fi
+
+    rm -f "$TMP_FILE"
 
     echo "$src_filename,$avail_src,$avail_tgt,$backup_name,$copied_flag,$src_size_kb,$tgt_size_kb,$bak_size_kb" >> "$SUMMARY_CSV"
 
