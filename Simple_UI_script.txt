@@ -63,3 +63,205 @@ class SimpleFormHandler(BaseHTTPRequestHandler):
 server = HTTPServer((HOST, PORT), SimpleFormHandler)
 print(f"Server running on http://localhost:{PORT}")
 server.serve_forever()
+
+
+
+
+
+
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+import html
+from datetime import datetime
+
+HOST = "0.0.0.0"
+PORT = 5000
+FILE = "submissions.txt"
+
+
+def get_form_html(message=""):
+    safe_message = html.escape(message)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>User Form</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+                font-family: Arial, sans-serif;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: linear-gradient(135deg, #0f172a, #1d4ed8, #06b6d4);
+                background-size: 400% 400%;
+                animation: gradientShift 12s ease infinite;
+            }}
+
+            @keyframes gradientShift {{
+                0% {{ background-position: 0% 50%; }}
+                50% {{ background-position: 100% 50%; }}
+                100% {{ background-position: 0% 50%; }}
+            }}
+
+            .card {{
+                width: 100%;
+                max-width: 430px;
+                background: rgba(255, 255, 255, 0.14);
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                backdrop-filter: blur(14px);
+                -webkit-backdrop-filter: blur(14px);
+                border-radius: 20px;
+                padding: 30px 28px;
+                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
+                color: white;
+            }}
+
+            h2 {{
+                margin: 0 0 8px 0;
+                font-size: 28px;
+                text-align: center;
+            }}
+
+            .subtitle {{
+                margin: 0 0 22px 0;
+                text-align: center;
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 14px;
+            }}
+
+            label {{
+                display: block;
+                margin-bottom: 8px;
+                margin-top: 14px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #f8fafc;
+            }}
+
+            input {{
+                width: 100%;
+                padding: 13px 14px;
+                border: none;
+                outline: none;
+                border-radius: 12px;
+                font-size: 15px;
+                background: rgba(255, 255, 255, 0.9);
+                color: #111827;
+                transition: transform 0.15s ease, box-shadow 0.15s ease;
+            }}
+
+            input:focus {{
+                transform: scale(1.01);
+                box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.35);
+            }}
+
+            .btn {{
+                width: 100%;
+                margin-top: 22px;
+                padding: 14px;
+                border: none;
+                border-radius: 12px;
+                font-size: 16px;
+                font-weight: bold;
+                cursor: pointer;
+                color: white;
+                background: linear-gradient(90deg, #22c55e, #16a34a);
+                box-shadow: 0 10px 24px rgba(34, 197, 94, 0.35);
+                transition: transform 0.15s ease, opacity 0.15s ease;
+            }}
+
+            .btn:hover {{
+                transform: translateY(-2px);
+                opacity: 0.95;
+            }}
+
+            .message {{
+                margin-top: 18px;
+                padding: 12px 14px;
+                border-radius: 12px;
+                text-align: center;
+                font-size: 14px;
+                background: rgba(34, 197, 94, 0.20);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                color: #ecfccb;
+            }}
+
+            .footer {{
+                margin-top: 16px;
+                text-align: center;
+                font-size: 12px;
+                color: rgba(255, 255, 255, 0.75);
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>User Form</h2>
+            <p class="subtitle">Enter the details below and click submit</p>
+
+            <form method="POST" action="/">
+                <label for="first_name">First Name</label>
+                <input type="text" id="first_name" name="first_name" placeholder="Enter first name" required>
+
+                <label for="last_name">Last Name</label>
+                <input type="text" id="last_name" name="last_name" placeholder="Enter last name" required>
+
+                <label for="phone">Phone Number</label>
+                <input type="text" id="phone" name="phone" placeholder="Enter phone number" required>
+
+                <button class="btn" type="submit">Submit</button>
+            </form>
+
+            {"<div class='message'>" + safe_message + "</div>" if safe_message else ""}
+
+            <div class="footer">Simple Python web form</div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+class SimpleFormHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        html_content = get_form_html()
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_content.encode("utf-8"))
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        post_data = self.rfile.read(content_length)
+        fields = urllib.parse.parse_qs(post_data.decode("utf-8"))
+
+        first = fields.get("first_name", [""])[0].strip()
+        last = fields.get("last_name", [""])[0].strip()
+        phone = fields.get("phone", [""])[0].strip()
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(FILE, "a", encoding="utf-8") as f:
+            f.write("{0},{1},{2},{3}\n".format(timestamp, first, last, phone))
+
+        html_content = get_form_html("Data saved successfully for {0} {1}".format(first, last))
+
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_content.encode("utf-8"))
+
+
+if __name__ == "__main__":
+    print("Server running on http://localhost:{0}".format(PORT))
+    server = HTTPServer((HOST, PORT), SimpleFormHandler)
+    server.serve_forever()
