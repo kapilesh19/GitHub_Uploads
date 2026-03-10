@@ -265,3 +265,160 @@ if __name__ == "__main__":
     print("Server running on http://localhost:{0}".format(PORT))
     server = HTTPServer((HOST, PORT), SimpleFormHandler)
     server.serve_forever()
+
+
+############### Oracle connectivity #####################
+
+import oracledb
+from contextlib import contextmanager
+from typing import Iterable, Sequence, Any
+
+
+DB_CONFIG = {
+    "user": "your_user",
+    "password": "your_password",
+    # Easy Connect string example:
+    # "host:port/service_name"
+    "dsn": "dbhost.example.com:1521/ORCLPDB1",
+}
+
+
+@contextmanager
+def get_connection():
+    conn = oracledb.connect(**DB_CONFIG)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetch_rows(sql: str, params: dict | None = None) -> list[tuple]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or {})
+            return cur.fetchall()
+
+
+def insert_rows(rows: Sequence[tuple[str, str, str]]) -> None:
+    sql = """
+        INSERT INTO person_stage (
+            first_name,
+            last_name,
+            phone_number
+        )
+        VALUES (:1, :2, :3)
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+
+
+def upsert_rows(rows: Sequence[tuple[str, str, str]]) -> None:
+    # Assumes phone_number is your business key for matching
+    sql = """
+        MERGE INTO person_stage t
+        USING (
+            SELECT :1 AS first_name,
+                   :2 AS last_name,
+                   :3 AS phone_number
+            FROM dual
+        ) s
+        ON (t.phone_number = s.phone_number)
+        WHEN MATCHED THEN
+            UPDATE SET
+                t.first_name = s.first_name,
+                t.last_name = s.last_name
+        WHEN NOT MATCHED THEN
+            INSERT (
+                first_name,
+                last_name,
+                phone_number
+            )
+            VALUES (
+                s.first_name,
+                s.last_name,
+                s.phone_number
+            )
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+
+
+def main():
+    # Query example
+    rows = fetch_rows(
+        """
+        SELECT first_name, last_name, phone_number
+        FROM person_stage
+        WHERE last_name = :last_name
+        ORDER BY first_name
+        """,
+        {"last_name": "Smith"},
+    )
+    print("Query result:")
+    for row in rows:
+        print(row)
+
+    # Insert example
+    new_rows = [
+        ("Kapilesh", "Prabhagar", "1111111111"),
+        ("John", "Smith", "2222222222"),
+    ]
+    insert_rows(new_rows)
+    print("Insert complete.")
+
+    # Upsert example
+    changed_rows = [
+        ("Kapilesh", "Prabhagar", "1111111111"),  # updates if exists
+        ("Alice", "Brown", "3333333333"),        # inserts if not exists
+    ]
+    upsert_rows(changed_rows)
+    print("Upsert complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+############# HTML for drop down ###################
+
+html = """
+<html>
+<head><title>User Form</title></head>
+<body>
+    <h2>User Input Form</h2>
+    <form method="POST" action="/">
+        First Name:<br>
+        <input type="text" name="first_name"><br><br>
+
+        Last Name:<br>
+        <input type="text" name="last_name"><br><br>
+
+        Phone Number:<br>
+        <input type="text" name="phone"><br><br>
+
+        Age:<br>
+        <select name="age">
+            <option value="20">20</option>
+            <option value="21">21</option>
+            <option value="22">22</option>
+            <option value="23">23</option>
+            <option value="24">24</option>
+            <option value="25">25</option>
+            <option value="26">26</option>
+            <option value="27">27</option>
+            <option value="28">28</option>
+            <option value="29">29</option>
+            <option value="30">30</option>
+        </select><br><br>
+
+        <input type="submit" value="Submit">
+    </form>
+</body>
+</html>
+"""
