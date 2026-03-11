@@ -1,0 +1,58 @@
+# Compliance / FCC studio text extraction
+
+$sourceFolder = "C:\Path\To\Your\ExportFolder"
+$outputFolder = "$sourceFolder\Extracted_files"
+
+if (!(Test-Path $outputFolder)) {
+    New-Item -ItemType Directory -Path $outputFolder | Out-Null
+}
+
+Get-ChildItem -Path $sourceFolder -Filter "*.dsnb" | ForEach-Object {
+    $file = $_
+    Write-Host "Processing: $($file.Name)"
+
+    try {
+        $dsnb = Get-Content $file.FullName -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "Failed to parse JSON in file: $($file.Name)"
+        return
+    }
+
+    $paragraphTexts = @()
+    $i = 1
+
+    foreach ($para in $dsnb.paragraphs) {
+
+        $msgText = ""
+
+        if ($null -ne $para.message) {
+            if ($para.message -is [System.Array]) {
+                # Compliance Studio format: array of lines
+                $msgText = ($para.message -join [Environment]::NewLine)
+            }
+            else {
+                # FCC Studio format: single string
+                $msgText = [string]$para.message
+            }
+        }
+
+        # Only add non-empty paragraphs
+        if (-not [string]::IsNullOrWhiteSpace($msgText)) {
+            $paragraphTexts += "Paragraph $i"
+            $paragraphTexts += "-----------"
+            $paragraphTexts += $msgText
+            $paragraphTexts += ""
+            $i++
+        }
+    }
+
+    $finalText = $paragraphTexts -join [Environment]::NewLine
+
+    $txtFileName = [System.IO.Path]::ChangeExtension($file.Name, ".txt")
+    $outputPath = Join-Path $outputFolder $txtFileName
+
+    $finalText | Out-File -FilePath $outputPath -Encoding UTF8
+
+    Write-Host "Written to: $outputPath"
+}
