@@ -1,47 +1,6 @@
-WITH your_objects AS (
-    SELECT 'FUNCTION1'  AS name, 'FUNCTION'  AS type FROM dual UNION ALL
-    SELECT 'FUNCTION2'  AS name, 'FUNCTION'  AS type FROM dual UNION ALL
-    SELECT 'FUNCTION3'  AS name, 'FUNCTION'  AS type FROM dual UNION ALL
-    SELECT 'FUNCTION4'  AS name, 'FUNCTION'  AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE1' AS name, 'PROCEDURE' AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE2' AS name, 'PROCEDURE' AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE3' AS name, 'PROCEDURE' AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE4' AS name, 'PROCEDURE' AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE5' AS name, 'PROCEDURE' AS type FROM dual UNION ALL
-    SELECT 'PROCEDURE6' AS name, 'PROCEDURE' AS type FROM dual
-),
-dependency_tree AS (
-    SELECT
-        d.name            AS object_name,
-        d.type            AS object_type,
-        d.referenced_name AS depends_on_name,
-        d.referenced_type AS depends_on_type
-    FROM all_dependencies d
-    INNER JOIN your_objects src ON src.name = d.name AND src.type = d.type
-    INNER JOIN your_objects ref ON ref.name = d.referenced_name AND ref.type = d.referenced_type
-    WHERE d.name != d.referenced_name  -- exclude self-references
-),
-hierarchy AS (
-    SELECT
-        o.name,
-        o.type,
-        LEVEL AS depth,
-        SYS_CONNECT_BY_PATH(o.name, ' -> ') AS dep_path
-    FROM your_objects o
-    LEFT JOIN dependency_tree d
-        ON d.object_name = o.name
-       AND d.object_type = o.type
-    START WITH d.depends_on_name IS NULL   -- no dependencies = create first
-    CONNECT BY NOCYCLE
-        PRIOR o.name = d.depends_on_name
-        AND   PRIOR o.type = d.depends_on_type
+SELECT REGEXP_REPLACE(
+    your_clob_column, 
+    '[^[:print:]\t\n\r\x09\x0A\x0DàâäéèêëîïôöùûüÿçæœÀÂÄÉÈÊËÎÏÔÖÙÛÜŸÇÆŒ]', 
+    ''
 )
-SELECT
-    ROW_NUMBER() OVER (ORDER BY MAX(depth), name) AS creation_order,
-    name,
-    type,
-    MAX(depth)   AS dependency_level,
-    MIN(dep_path) AS dependency_path
-FROM hierarchy
-GROUP BY name, type
-ORDER BY dependency_level, name;
+FROM your_table;
